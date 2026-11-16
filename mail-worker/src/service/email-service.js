@@ -493,10 +493,11 @@ const emailService = {
 
 		const domain = emailUtils.getDomain(accountRow.email);
 		const resendToken = resendTokens[domain];
+		const brevoApiKey = c.env.brevoApiKey;
 		const useCloudflareEmail = !!c.env.email;
 
 		//如果接收方存在站外邮箱，又没有发信服务
-		if (!useCloudflareEmail && !resendToken && !allInternal) {
+		if (!useCloudflareEmail && !resendToken && !brevoApiKey && !allInternal) {
 			throw new BizError(t('noSendProvider'));
 		}
 
@@ -550,7 +551,7 @@ const emailService = {
 
 		// sendParams 用于渠道请求，saveParams 保留保存记录所需的账号、权限和附件数据。
 		const context = {
-			separate, allInternal, useCloudflareEmail, resendToken, sendParams,
+			separate, allInternal, useCloudflareEmail, resendToken, brevoApiKey, sendParams,
 			saveParams: {
 				accountId, userId, name, subject, text, html,
 				sendEmail: accountRow.email,
@@ -561,14 +562,16 @@ const emailService = {
 			}
 		};
 
-		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend。
+		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend，最后 Brevo。
 		let deliveries;
 		if (allInternal) {
 			deliveries = this.sendInternal(c, context);
 		} else if (useCloudflareEmail) {
 			deliveries = this.sendCloudflare(c, context);
-		} else {
+		} else if (resendToken) {
 			deliveries = this.sendResend(c, context);
+		} else {
+			deliveries = this.sendBrevo(c, context);
 		}
 
 		const emailResults = [];
@@ -672,6 +675,97 @@ const emailService = {
 			}));
 		}
 		yield { emails };
+	},
+
+	// Brevo 分开发送逐人调用单封接口（Brevo 没有批量接口），普通发送一次提交所有收件人。
+	async *sendBrevo(c, { separate, brevoApiKey, sendParams, saveParams }) {
+		if (separate && sendParams.receiveEmail.length > 100) {
+			throw new BizError(t('recipientLimit'));
+		}
+		const emails = [];
+		if (!separate) {
+			const result = await this.sendByBrevo(brevoApiKey, sendParams);
+			emails.push(await this.saveSentEmail(c, {
+				...saveParams, receiveEmail: sendParams.receiveEmail, providerId: result.messageId
+			}));
+			yield { emails };
+			return;
+		}
+		for (const address of sendParams.receiveEmail) {
+			let result;
+			try {
+				result = await this.sendByBrevo(brevoApiKey, { ...sendParams, receiveEmail: [address] });
+			} catch (error) {
+				// 分开发送遇到渠道错误即停止，已成功的记录由入口汇总。
+				yield { error: { message: error.message } };
+				return;
+			}
+			emails.push(await this.saveSentEmail(c, {
+				...saveParams, receiveEmail: [address], providerId: result.messageId
+			}));
+		}
+		yield { emails };
+	},
+
+	// Brevo 交易邮件接口：POST https://api.brevo.com/v3/smtp/email，api-key 请求头，成功返回 201 与 messageId。
+	async sendByBrevo(brevoApiKey, params) {
+		const body = {
+			sender: { name: params.name, email: params.accountEmail },
+			to: params.receiveEmail.map(email => ({ email })),
+			subject: params.subject
+		};
+
+		if (params.ccEmail.length > 0) {
+			body.cc = params.ccEmail.map(email => ({ email }));
+		}
+
+		if (params.bccEmail.length > 0) {
+			body.bcc = params.bccEmail.map(email => ({ email }));
+		}
+
+		if (params.text) {
+			body.textContent = params.text;
+		}
+
+		if (params.html) {
+			body.htmlContent = params.html;
+		}
+
+		const attachments = await this.toBrevoAttachments(params.attachments);
+		if (attachments.length > 0) {
+			body.attachment = attachments;
+		}
+
+		if (params.sendType === 'reply' && params.messageId) {
+			body.headers = {
+				'In-Reply-To': params.messageId,
+				'References': params.messageId
+			};
+		}
+
+		const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+			method: 'POST',
+			headers: {
+				'accept': 'application/json',
+				'content-type': 'application/json',
+				'api-key': brevoApiKey
+			},
+			body: JSON.stringify(body)
+		});
+		const result = await response.json().catch(() => ({}));
+		if (!response.ok) {
+			throw new Error(result.message ? `Brevo ${response.status}: ${result.message}` : `Brevo ${response.status}`);
+		}
+		return result;
+	},
+
+	// Brevo 附件格式：base64 内容 + 文件名，复用 Resend 的 base64 产出。
+	async toBrevoAttachments(attachments = []) {
+		const resendAttachments = await this.toResendAttachments(attachments);
+		return resendAttachments.map(attachment => ({
+			content: attachment.content,
+			name: attachment.filename || attachment.name || 'attachment'
+		}));
 	},
 
 	// 三个渠道共用的发件记录保存：恢复正文图片 URL、保存附件并更新发送计数。
